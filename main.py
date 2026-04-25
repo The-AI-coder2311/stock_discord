@@ -972,25 +972,41 @@ async def alert_loop():
         conn.close()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOT STARTUP
+# BOT STARTUP (RAILWAY SAFE)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot.event
 async def on_ready():
     await tree.sync()
-    alert_loop.start()
-    log.info(f"Ready: {bot.user}  |  {len(tree.get_commands())} slash commands synced")
+    if not alert_loop.is_running():
+        alert_loop.start()
+    log.info(f"Ready: {bot.user} | Slash commands synced")
+
+
+async def run_api():
+    """Run FastAPI inside Railway container safely."""
+    config = uvicorn.Config(
+        api,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        log_level="warning",
+        loop="asyncio",
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 async def main():
     db_init()
-    config = uvicorn.Config(api, host="0.0.0.0",
-                            port=int(os.environ.get("PORT", 8000)),
-                            log_level="warning")
-    server = uvicorn.Server(config)
+
     async with bot:
-        await asyncio.gather(bot.start(os.environ["DISCORD_TOKEN"]), server.serve())
+        bot_task = asyncio.create_task(bot.start(os.environ["DISCORD_TOKEN"]))
+        api_task = asyncio.create_task(run_api())
+
+        await asyncio.gather(bot_task, api_task)
 
 
+if __name__ == "__main__":
+    asyncio.run(main())
 if __name__ == "__main__":
     asyncio.run(main())

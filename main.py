@@ -61,7 +61,7 @@ import yfinance as yf
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
-
+print("DB URL =", os.environ.get("DATABASE_URL"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",

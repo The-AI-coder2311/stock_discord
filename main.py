@@ -709,19 +709,45 @@ async def logs_cmd(i: discord.Interaction):
 
 # ───────────────────────── SYNC ─────────────────────────
 
-async def sync():
+# Optional: set a DEV_GUILD_ID env var for instant guild-scoped syncing during
+# development. Leave it unset in production for global registration.
+DEV_GUILD_ID = int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID") else None
+
+async def sync_commands():
+    """
+    Sync the command tree with Discord.
+
+    - Dev mode  (DEV_GUILD_ID set): copies globals → guild and syncs only that
+      guild. Takes effect instantly.
+    - Prod mode (DEV_GUILD_ID unset): global sync. Can take up to 1 hour to
+      propagate, but works in every server the bot is in.
+    """
     try:
-        synced = await tree.sync()
-        log.info(f"Synced {len(synced)} commands")
+        if DEV_GUILD_ID:
+            guild = discord.Object(id=DEV_GUILD_ID)
+            # Mirror all global commands into the guild so nothing is missed.
+            tree.copy_global_to(guild=guild)
+            synced = await tree.sync(guild=guild)
+            log.info(f"[DEV] Synced {len(synced)} commands to guild {DEV_GUILD_ID}")
+        else:
+            synced = await tree.sync()
+            log.info(f"[PROD] Synced {len(synced)} commands globally")
+
+        # Log every registered command name for easy verification.
+        names = [c.name for c in synced]
+        log.info(f"Registered commands: {names}")
+
+    except discord.HTTPException as e:
+        log.error(f"Sync failed (HTTP {e.status}): {e.text}")
     except Exception as e:
-        log.error(e)
+        log.error(f"Sync failed: {e}")
 
 # ───────────────────────── EVENTS ─────────────────────────
 
 @client.event
 async def on_ready():
-    log.info(f"Logged in as {client.user}")
-    await sync()
+    log.info(f"Logged in as {client.user} (id: {client.user.id})")
+    await sync_commands()
     if not alert_loop.is_running():
         alert_loop.start()
     if ALERT_CHANNEL_ID and not daily_digest.is_running():
@@ -738,6 +764,17 @@ async def run_api():
 
 async def main():
     db_init()
+
+    # Validate that all command groups are attached to the tree before
+    # connecting, so a missing add_command() call is caught at startup.
+    registered = {c.name for c in tree.get_commands()}
+    expected = {"ping", "price", "simulate", "watchlist", "alert", "portfolio",
+                "leaderboard", "logs"}
+    missing = expected - registered
+    if missing:
+        raise RuntimeError(f"Commands not registered with tree: {missing}")
+    log.info(f"Pre-flight OK — {len(registered)} commands ready to sync")
+
     await asyncio.gather(
         client.start(TOKEN),
         run_api(),

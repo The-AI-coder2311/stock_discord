@@ -16,6 +16,7 @@ from discord.ext import tasks
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 
+import requests
 import psycopg2
 import psycopg2.extras
 import yfinance as yf
@@ -27,11 +28,12 @@ import matplotlib.patches as mpatches
 
 # ───────────────────────── CONFIG ─────────────────────────
 
-TOKEN          = os.environ["DISCORD_TOKEN"]
-PORT           = int(os.environ.get("PORT", 8000))
+TOKEN            = os.environ["DISCORD_TOKEN"]
+PORT             = int(os.environ.get("PORT", 8000))
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", 0))
-WATCHLIST_FILE = Path("watchlists.json")
-PORTFOLIO_FILE = Path("portfolios.json")
+NEWS_API_KEY     = os.environ.get("NEWS_API_KEY", "")
+WATCHLIST_FILE   = Path("watchlists.json")
+PORTFOLIO_FILE   = Path("portfolios.json")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -228,6 +230,8 @@ def rsi(closes: list[float], period=14) -> float | None:
 def fetch(ticker: str) -> dict:
     t       = yf.Ticker(ticker.upper())
     h       = t.history(period="60d")
+    if h.empty or len(h) < 3:
+        raise ValueError(f"No usable price history for '{ticker.upper()}'")
     closes  = h["Close"].tolist()
     volumes = h["Volume"].tolist()
 
@@ -252,6 +256,87 @@ def fetch(ticker: str) -> dict:
         "vol_spike":  vol_spike,
         "closes":     closes,
     }
+
+# ───────────────────────── NEWS ─────────────────────────
+
+NEWS_API_URL           = "https://newsapi.org/v2/everything"
+NEWS_TOP_HEADLINES_URL = "https://newsapi.org/v2/top-headlines"
+
+def fetch_market_news(limit: int = 5) -> list[dict]:
+    """
+    Pulls general business/market headlines (not tied to one ticker) via
+    NewsAPI's top-headlines endpoint. Returns [] on any failure.
+    """
+    if not NEWS_API_KEY:
+        return []
+
+    try:
+        resp = requests.get(
+            NEWS_TOP_HEADLINES_URL,
+            params={
+                "category": "business",
+                "language": "en",
+                "country":  "us",
+                "pageSize": limit,
+                "apiKey":   NEWS_API_KEY,
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"Market news fetch failed: {e}")
+        return []
+
+    articles = data.get("articles", [])[:limit]
+    return [
+        {
+            "title":        a.get("title", "(untitled)"),
+            "source":       (a.get("source") or {}).get("name", "unknown"),
+            "url":          a.get("url", ""),
+            "published_at": a.get("publishedAt", ""),
+        }
+        for a in articles
+    ]
+
+def fetch_news(ticker: str, limit: int = 3) -> list[dict]:
+    """
+    Pulls recent headlines for a ticker via NewsAPI.org.
+    Returns a list of {title, source, url, published_at}, newest first.
+    Returns [] on any failure rather than raising, so callers can
+    degrade gracefully (e.g. skip news in a digest line).
+    """
+    if not NEWS_API_KEY:
+        return []
+
+    try:
+        resp = requests.get(
+            NEWS_API_URL,
+            params={
+                "q":        f'"{ticker.upper()}"',
+                "language": "en",
+                "sortBy":   "publishedAt",
+                "pageSize": limit,
+                "apiKey":   NEWS_API_KEY,
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"News fetch failed for {ticker}: {e}")
+        return []
+
+    articles = data.get("articles", [])[:limit]
+    return [
+        {
+            "title":        a.get("title", "(untitled)"),
+            "source":       (a.get("source") or {}).get("name", "unknown"),
+            "url":          a.get("url", ""),
+            "published_at": a.get("publishedAt", ""),
+        }
+        for a in articles
+    ]
 
 # ───────────────────────── MONTE CARLO ─────────────────────────
 
@@ -512,6 +597,10 @@ async def daily_digest():
                 f"{arrow} **{ticker}** ${d['price']:.2f} ({d['pct']:+.2f}%) | "
                 f"RSI {d['rsi']} | Vol spike {d['vol_spike']:.1f}x"
             )
+            headlines = fetch_news(ticker, limit=1)
+            if headlines:
+                h = headlines[0]
+                lines.append(f"　📰 {h['title']} — *{h['source']}*")
         except Exception:
             lines.append(f"⚠️ {ticker}: fetch error")
 
@@ -557,6 +646,30 @@ async def price(i: discord.Interaction, ticker: str):
         f"```"
     )
     await i.followup.send(msg)
+
+# ── /news ──
+
+@tree.command(name="news", description="Get recent headlines — for a ticker, or general market news if left blank")
+async def news_cmd(i: discord.Interaction, ticker: str = None):
+    await i.response.defer()
+
+    if ticker:
+        headlines = fetch_news(ticker, limit=5)
+        header    = f"📰 **Recent news for {ticker.upper()}**\n"
+        empty_msg = f"No recent news found for `{ticker.upper()}` (or news isn't configured)."
+    else:
+        headlines = fetch_market_news(limit=5)
+        header    = "📰 **Top Market Headlines**\n"
+        empty_msg = "No market news available right now (or news isn't configured)."
+
+    if not headlines:
+        await i.followup.send(empty_msg)
+        return
+
+    lines = [header]
+    for h in headlines:
+        lines.append(f"• [{h['title']}]({h['url']}) — *{h['source']}*")
+    await i.followup.send("\n".join(lines))
 
 # ── /simulate ──
 
@@ -769,9 +882,11 @@ async def leaderboard(i: discord.Interaction):
             pass
 
     results.sort(key=lambda x: x[2], reverse=True)
+    TOP_N = 10
+    trimmed = results[:TOP_N]
 
-    lines = ["🏆 **Top Movers Today**\n```"]
-    for rank, (ticker, px, pct) in enumerate(results, 1):
+    lines = [f"🏆 **Top Movers Today** (showing top {min(TOP_N, len(results))} of {len(results)})\n```"]
+    for rank, (ticker, px, pct) in enumerate(trimmed, 1):
         arrow = "▲" if pct >= 0 else "▼"
         lines.append(f"#{rank:<3} {ticker:<8} ${px:>10.2f}  {arrow} {pct:+.2f}%")
     lines.append("```")
@@ -837,7 +952,7 @@ async def main():
     db_init()
 
     registered = {c.name for c in tree.get_commands()}
-    expected   = {"ping", "price", "simulate", "watchlist", "alert", "portfolio",
+    expected   = {"ping", "price", "news", "simulate", "watchlist", "alert", "portfolio",
                   "leaderboard", "logs"}
     missing    = expected - registered
     if missing:

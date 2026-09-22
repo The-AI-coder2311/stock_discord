@@ -6,7 +6,7 @@ import random
 import statistics
 import logging
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import discord
@@ -31,7 +31,7 @@ import matplotlib.patches as mpatches
 TOKEN            = os.environ["DISCORD_TOKEN"]
 PORT             = int(os.environ.get("PORT", 8000))
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", 0))
-NEWS_API_KEY     = os.environ.get("NEWS_API_KEY", "")
+FINNHUB_API_KEY  = os.environ.get("FINNHUB_API_KEY", "")
 WATCHLIST_FILE   = Path("watchlists.json")
 PORTFOLIO_FILE   = Path("portfolios.json")
 
@@ -259,81 +259,77 @@ def fetch(ticker: str) -> dict:
 
 # ───────────────────────── NEWS ─────────────────────────
 
-NEWS_API_URL           = "https://newsapi.org/v2/everything"
-NEWS_TOP_HEADLINES_URL = "https://newsapi.org/v2/top-headlines"
+FINNHUB_COMPANY_NEWS_URL = "https://finnhub.io/api/v1/company-news"
+FINNHUB_GENERAL_NEWS_URL = "https://finnhub.io/api/v1/news"
 
 def fetch_market_news(limit: int = 5) -> list[dict]:
     """
-    Pulls general business/market headlines (not tied to one ticker) via
-    NewsAPI's top-headlines endpoint. Returns [] on any failure.
+    Pulls general market headlines (not tied to one ticker) via Finnhub's
+    /news?category=general endpoint. Real-time, no 24h delay.
+    Returns [] on any failure rather than raising.
     """
-    if not NEWS_API_KEY:
+    if not FINNHUB_API_KEY:
         return []
 
     try:
         resp = requests.get(
-            NEWS_TOP_HEADLINES_URL,
-            params={
-                "category": "business",
-                "language": "en",
-                "country":  "us",
-                "pageSize": limit,
-                "apiKey":   NEWS_API_KEY,
-            },
+            FINNHUB_GENERAL_NEWS_URL,
+            params={"category": "general", "token": FINNHUB_API_KEY},
             timeout=8,
         )
         resp.raise_for_status()
-        data = resp.json()
+        articles = resp.json()
     except Exception as e:
         log.warning(f"Market news fetch failed: {e}")
         return []
 
-    articles = data.get("articles", [])[:limit]
+    articles = sorted(articles, key=lambda a: a.get("datetime", 0), reverse=True)[:limit]
     return [
         {
-            "title":        a.get("title", "(untitled)"),
-            "source":       (a.get("source") or {}).get("name", "unknown"),
+            "title":        a.get("headline", "(untitled)"),
+            "source":       a.get("source", "unknown"),
             "url":          a.get("url", ""),
-            "published_at": a.get("publishedAt", ""),
+            "published_at": a.get("datetime", 0),
         }
         for a in articles
     ]
 
-def fetch_news(ticker: str, limit: int = 3) -> list[dict]:
+def fetch_news(ticker: str, limit: int = 3, days_back: int = 7) -> list[dict]:
     """
-    Pulls recent headlines for a ticker via NewsAPI.org.
-    Returns a list of {title, source, url, published_at}, newest first.
-    Returns [] on any failure rather than raising, so callers can
-    degrade gracefully (e.g. skip news in a digest line).
+    Pulls recent headlines for a ticker via Finnhub's /company-news endpoint.
+    Real-time, no 24h delay. Returns [] on any failure rather than raising,
+    so callers can degrade gracefully (e.g. skip news in a digest line).
     """
-    if not NEWS_API_KEY:
+    if not FINNHUB_API_KEY:
         return []
+
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days_back)
 
     try:
         resp = requests.get(
-            NEWS_API_URL,
+            FINNHUB_COMPANY_NEWS_URL,
             params={
-                "q":        f'"{ticker.upper()}"',
-                "language": "en",
-                "sortBy":   "publishedAt",
-                "pageSize": limit,
-                "apiKey":   NEWS_API_KEY,
+                "symbol": ticker.upper(),
+                "from":   start.isoformat(),
+                "to":     today.isoformat(),
+                "token":  FINNHUB_API_KEY,
             },
             timeout=8,
         )
         resp.raise_for_status()
-        data = resp.json()
+        articles = resp.json()
     except Exception as e:
         log.warning(f"News fetch failed for {ticker}: {e}")
         return []
 
-    articles = data.get("articles", [])[:limit]
+    articles = sorted(articles, key=lambda a: a.get("datetime", 0), reverse=True)[:limit]
     return [
         {
-            "title":        a.get("title", "(untitled)"),
-            "source":       (a.get("source") or {}).get("name", "unknown"),
+            "title":        a.get("headline", "(untitled)"),
+            "source":       a.get("source", "unknown"),
             "url":          a.get("url", ""),
-            "published_at": a.get("publishedAt", ""),
+            "published_at": a.get("datetime", 0),
         }
         for a in articles
     ]
@@ -669,7 +665,7 @@ async def news_cmd(i: discord.Interaction, ticker: str = None):
     lines = [header]
     for h in headlines:
         lines.append(f"• [{h['title']}]({h['url']}) — *{h['source']}*")
-    await i.followup.send("\n".join(lines))
+    await i.followup.send("\n".join(lines), suppress_embeds=True)
 
 # ── /simulate ──
 
